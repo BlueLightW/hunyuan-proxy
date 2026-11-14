@@ -1,7 +1,7 @@
 // src/account-manager.js
 import { accountDB } from './database.js';
 import { config } from './config.js';
-import { startMimoInstanceWithPlaywright } from './mimo-instance.js';
+import { startHunyuanInstanceWithPlaywright } from './mimo-instance.js';
 
 export class AccountManager {
   constructor() {
@@ -71,7 +71,7 @@ export class AccountManager {
       return existingSession;
     }
 
-    const session = await startMimoInstanceWithPlaywright(account);
+    const session = await startHunyuanInstanceWithPlaywright(account);
     if (!session) {
       throw new Error(`Falha ao iniciar sessão para a conta ${account.email}`);
     }

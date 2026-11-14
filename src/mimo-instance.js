@@ -5,6 +5,10 @@ import { accountDB } from './database.js';
 import { config } from './config.js';
 import path from 'path';
 import fs from 'fs';
+import { chromium } from 'playwright-extra';
+import StealthPlugin from 'puppeteer-extra-plugin-stealth';
+
+chromium.use(StealthPlugin());
 
 const execAsync = promisify(exec);
 
@@ -81,7 +85,50 @@ async function checkMimoHealth(url) {
   }
 }
 
-import { chromium } from 'playwright';
+// Argumentos para evitar detecção de automação
+const LAUNCH_ARGS = [
+  '--no-first-run',
+  '--no-default-browser-check',
+  '--disable-infobars',
+  '--window-position=0,0',
+  '--window-size=1280,800',
+];
+
+// Função para esperar intervenção humana (captcha + código email)
+async function waitForHumanIntervention(page, timeoutMs = 300000) {
+  console.log('[HunyuanInstance] ==========================================');
+  console.log('[HunyuanInstance] INTERVENÇÃO HUMANA NECESSÁRIA');
+  console.log('[HunyuanInstance] 1. Resolva o captcha (slide puzzle)');
+  console.log('[HunyuanInstance] 2. Digite o código de verificação recebido por email');
+  console.log('[HunyuanInstance] 3. Clique em enviar/confirmar');
+  console.log('[HunyuanInstance] Aguardando até ' + (timeoutMs/1000) + ' segundos...');
+  console.log('[HunyuanInstance] ==========================================');
+  
+  const startTime = Date.now();
+  
+  while (Date.now() - startTime < timeoutMs) {
+    // Verificar se textarea "Ask me anything" apareceu (login sucesso)
+    const loggedIn = await page.evaluate(() => {
+      const textarea = document.querySelector('textarea[placeholder="Ask me anything"]');
+      return textarea !== null;
+    });
+    
+    if (loggedIn) {
+      console.log('[HunyuanInstance] Login detectado! Textarea "Ask me anything" encontrado.');
+      return true;
+    }
+    
+    // Verificar se ainda há captcha visível
+    const captchaVisible = await page.locator('#tcWrap, .tc-captcha, iframe[src*="captcha"]').first().isVisible().catch(() => false);
+    if (captchaVisible) {
+      console.log('[HunyuanInstance] Captcha ainda visível, aguardando resolução...');
+    }
+    
+    await page.waitForTimeout(5000);
+  }
+  
+  throw new Error('Timeout aguardando intervenção humana (captcha + código email)');
+}
 
 // Alternativa: Se o `mimo serve` não aceita autenticação por linha de comando,
 // você pode usar Playwright para fazer login automático:
@@ -167,4 +214,182 @@ export async function startMimoInstanceWithPlaywright(account) {
   const cookies = await context.cookies();
 
   return { sessionId, browser: context, context, page, authData, cookies };
+}
+
+// Nova função para Hunyuan (Tencent AI Studio) - fluxo exato conforme especificado
+export async function startHunyuanInstanceWithPlaywright(account) {
+  const profilePath = path.join(profilesDir, `account-${account.id}`);
+  if (!fs.existsSync(profilePath)) fs.mkdirSync(profilePath, { recursive: true });
+  const sessionId = `hunyuan-session-${account.id}-${Date.now()}`;
+  
+  const context = await chromium.launchPersistentContext(profilePath, { 
+    headless: false,
+    args: LAUNCH_ARGS,
+    viewport: { width: 1280, height: 800 },
+  });
+  
+  const page = context.pages()[0] || await context.newPage();
+
+  const loginUrl = process.env.TENCENT_LOGIN_URL || "https://aistudio.tencent.ai";
+  
+  console.log('[HunyuanInstance] Navegando para:', loginUrl);
+  await page.goto(loginUrl, { waitUntil: "domcontentloaded" });
+  await page.waitForTimeout(3000);
+
+  // Verificar se já está logado (textarea "Ask me anything")
+  const isLoggedIn = await page.evaluate(() => {
+    return document.querySelector('textarea[placeholder="Ask me anything"]') !== null;
+  });
+
+  if (isLoggedIn) {
+    console.log('[HunyuanInstance] Já logado (textarea encontrado)');
+    return { sessionId, browser: context, context, page };
+  }
+
+  console.log('[HunyuanInstance] Não logado, iniciando fluxo de login...');
+  
+  // ===== PASSO 1: Clicar no botão "Log In" =====
+  console.log('[HunyuanInstance] Procurando botão "Log In"...');
+  const loginBtn = page.locator('button.side-menu-layout__r__btn:has-text("Log In"), button:has-text("Log In")').first();
+  if (await loginBtn.isVisible().catch(() => false)) {
+    console.log('[HunyuanInstance] Clicando em "Log In"');
+    await loginBtn.click();
+    await page.waitForTimeout(2000);
+  } else {
+    console.log('[HunyuanInstance] Botão "Log In" não encontrado, tentando seletores alternativos...');
+    // Fallback seletores
+    const altSelectors = [
+      'button:has-text("Sign in")',
+      'button:has-text("Entrar")',
+      'button:has-text("Login")',
+      'a:has-text("Log In")',
+      'a:has-text("Sign in")',
+    ];
+    for (const selector of altSelectors) {
+      const btn = page.locator(selector).first();
+      if (await btn.isVisible().catch(() => false)) {
+        console.log('[HunyuanInstance] Clicando em login alternativo:', selector);
+        await btn.click();
+        await page.waitForTimeout(2000);
+        break;
+      }
+    }
+  }
+  
+  // ===== PASSO 2: Preencher email =====
+  console.log('[HunyuanInstance] Procurando input de email...');
+  const emailInput = page.locator('input[type="email"][placeholder="mail@domain.com"], input.Oik6u2AxDeR6psNnkJD9[type="email"]').first();
+  if (await emailInput.isVisible().catch(() => false)) {
+    console.log('[HunyuanInstance] Preenchendo email:', account.email);
+    await emailInput.fill(account.email);
+    await page.waitForTimeout(500);
+  } else {
+    // Fallback
+    const altEmail = page.locator('input[type="email"]').first();
+    if (await altEmail.isVisible().catch(() => false)) {
+      console.log('[HunyuanInstance] Preenchendo email (fallback)');
+      await altEmail.fill(account.email);
+      await page.waitForTimeout(500);
+    }
+  }
+  
+  // ===== PASSO 3: Clicar botão "Send" para enviar código de verificação =====
+  console.log('[HunyuanInstance] Procurando botão "Send"...');
+  const sendBtn = page.locator('button.BMrF95RoZzWYgPCu6a2m:has-text("Send"), button:has-text("Send")').first();
+  if (await sendBtn.isVisible().catch(() => false)) {
+    console.log('[HunyuanInstance] Clicando "Send" para enviar código de verificação');
+    await sendBtn.click();
+    await page.waitForTimeout(3000);
+  } else {
+    console.log('[HunyuanInstance] Botão "Send" não encontrado, tentando alternativas...');
+    const altSend = page.locator('button:has-text("Enviar"), button:has-text("Send code"), button[type="button"]').first();
+    if (await altSend.isVisible().catch(() => false)) {
+      await altSend.click();
+      await page.waitForTimeout(3000);
+    }
+  }
+  
+  // ===== PASSO 4: Marcar checkbox de política de privacidade =====
+  console.log('[HunyuanInstance] Procurando checkbox de política de privacidade...');
+  const privacyCheckbox = page.locator('input.t-checkbox__former[type="checkbox"], input[type="checkbox"].t-checkbox__former').first();
+  if (await privacyCheckbox.isVisible().catch(() => false)) {
+    const isChecked = await privacyCheckbox.isChecked().catch(() => false);
+    if (!isChecked) {
+      console.log('[HunyuanInstance] Marcando checkbox de privacidade');
+      await privacyCheckbox.check();
+      await page.waitForTimeout(500);
+    }
+  } else {
+    // Fallback: qualquer checkbox visível na área de login
+    const altCheckbox = page.locator('input[type="checkbox"]').first();
+    if (await altCheckbox.isVisible().catch(() => false)) {
+      const isChecked = await altCheckbox.isChecked().catch(() => false);
+      if (!isChecked) {
+        console.log('[HunyuanInstance] Marcando checkbox alternativo');
+        await altCheckbox.check();
+        await page.waitForTimeout(500);
+      }
+    }
+  }
+  
+  // ===== PASSO 5: Clicar novamente no botão Send/Confirmar e AGUARDAR HUMANO =====
+  console.log('[HunyuanInstance] Checkbox marcado. Clicando novamente para prosseguir...');
+  const sendBtn2 = page.locator('button.BMrF95RoZzWYgPCu6a2m:has-text("Send"), button:has-text("Send"), button:has-text("Confirm"), button:has-text("Continuar"), button[type="submit"]').first();
+  if (await sendBtn2.isVisible().catch(() => false)) {
+    await sendBtn2.click();
+    await page.waitForTimeout(3000);
+  }
+  
+  // ===== AGUARDAR INTERVENÇÃO HUMANA: Captcha + Código Email =====
+  console.log('[HunyuanInstance] Aguardando intervenção humana (captcha + código de email)...');
+  await waitForHumanIntervention(page, 300000); // 5 minutos
+  
+  // ===== VERIFICAÇÃO FINAL: Textarea "Ask me anything" =====
+  console.log('[HunyuanInstance] Verificando se textarea "Ask me anything" apareceu...');
+  try {
+    await page.waitForSelector('textarea[placeholder="Ask me anything"]', { timeout: 30000 });
+    console.log('[HunyuanInstance] SUCESSO: Textarea "Ask me anything" encontrado! Login completo.');
+  } catch (e) {
+    // Última verificação via evaluate
+    const finalCheck = await page.evaluate(() => {
+      return document.querySelector('textarea[placeholder="Ask me anything"]') !== null;
+    });
+    if (!finalCheck) {
+      throw new Error('Textarea "Ask me anything" não encontrado após intervenção humana');
+    }
+    console.log('[HunyuanInstance] SUCESSO: Textarea encontrado (verificação final)');
+  }
+  
+  // Extrair cookies e tokens
+  const authData = await page.evaluate(() => {
+    const tokens = {};
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key && (key.includes('auth') || key.includes('token') || key.includes('session') || key.includes('access') || key.includes('cookie'))) {
+        tokens[key] = localStorage.getItem(key);
+      }
+    }
+    for (let i = 0; i < sessionStorage.length; i++) {
+      const key = sessionStorage.key(i);
+      if (key && (key.includes('auth') || key.includes('token') || key.includes('session') || key.includes('access') || key.includes('cookie'))) {
+        tokens[key] = sessionStorage.getItem(key);
+      }
+    }
+    return tokens;
+  });
+
+  const cookies = await context.cookies();
+  console.log('[HunyuanInstance] Cookies obtidos:', cookies.length);
+  console.log('[HunyuanInstance] Sessão pronta para uso!');
+
+  return { sessionId, browser: context, context, page, authData, cookies };
+}
+
+// Função auxiliar: importar cookies de um navegador já logado
+export async function importCookiesFromBrowser(cookieString) {
+  const cookies = cookieString.split('; ').map(c => {
+    const [name, ...rest] = c.split('=');
+    return { name: name.trim(), value: rest.join('=').trim(), domain: '.tencent.com', path: '/' };
+  });
+  return cookies;
 }

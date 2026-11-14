@@ -1,6 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+
+// Set required env before importing config-dependent modules
+process.env.HUNYUAN_PROXY_TOKEN = "test-token";
+process.env.HUNYUAN_PROXY_REQUIRE_AUTH = "true";
+
 import { isAuthorized } from "../src/auth.js";
 import { openAIModels } from "../src/openai.js";
 

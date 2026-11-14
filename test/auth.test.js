@@ -1,5 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+
+// Set required env before importing config-dependent modules
+process.env.HUNYUAN_PROXY_TOKEN = "test-token";
+process.env.HUNYUAN_PROXY_REQUIRE_AUTH = "true";
+
 import { safeCompare, isAuthorized, readBody, deny, bad } from "../src/auth.js";
 import { EventEmitter } from "node:events";
 
@@ -23,7 +28,7 @@ test("safeCompare returns false for invalid input types", () => {
 
 test("isAuthorized returns boolean based on request headers", () => {
   const mockReq = {
-    headers: { "x-api-key": process.env.MIMO_PROXY_TOKEN || "" },
+    headers: { "x-api-key": process.env.HUNYUAN_PROXY_TOKEN || "" },
     url: "/v1/models",
   };
   assert.equal(typeof isAuthorized(mockReq), "boolean");
@@ -34,11 +39,11 @@ test("readBody parses valid JSON body", async () => {
   mockReq.destroy = () => {};
 
   const promise = readBody(mockReq);
-  mockReq.emit("data", Buffer.from(JSON.stringify({ model: "mimo-auto" })));
+  mockReq.emit("data", Buffer.from(JSON.stringify({ model: "hunyuan-turbo" })));
   mockReq.emit("end");
 
   const body = await promise;
-  assert.equal(body.model, "mimo-auto");
+  assert.equal(body.model, "hunyuan-turbo");
 });
 
 test("readBody rejects when payload exceeds limit", async () => {

@@ -1,5 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+
+// Set required env before importing config-dependent modules
+process.env.HUNYUAN_PROXY_TOKEN = "test-token";
+process.env.HUNYUAN_PROXY_REQUIRE_AUTH = "true";
+
 import {
   genId,
   openAIModels,
@@ -20,12 +25,12 @@ test("genId generates chatcmpl- prefixed string", () => {
   assert.notEqual(id1, id2);
 });
 
-test("openAIModels returns list of mimo models", () => {
+test("openAIModels returns list of hunyuan models", () => {
   const models = openAIModels();
   assert.equal(models.object, "list");
   assert.ok(Array.isArray(models.data));
   assert.ok(models.data.length > 0);
-  assert.equal(models.data[0].owned_by, "xiaomi");
+  assert.equal(models.data[0].owned_by, "tencent");
 });
 
 test("extractText extracts text parts from mimo JSON", () => {
@@ -62,7 +67,7 @@ test("calculateUsage computes prompt and completion tokens", () => {
 test("openAICompletion constructs valid chat completion object", () => {
   const comp = openAICompletion(
     "chatcmpl-123",
-    "mimo-auto",
+    "hunyuan-turbo",
     1700000000,
     "Hello there!",
     null,
@@ -71,7 +76,7 @@ test("openAICompletion constructs valid chat completion object", () => {
 
   assert.equal(comp.id, "chatcmpl-123");
   assert.equal(comp.object, "chat.completion");
-  assert.equal(comp.model, "mimo-auto");
+  assert.equal(comp.model, "hunyuan-turbo");
   assert.equal(comp.choices[0].message.content, "Hello there!");
   assert.equal(comp.choices[0].finish_reason, "stop");
 });
@@ -86,7 +91,7 @@ test("openAICompletion sets finish_reason tool_calls when tools exist", () => {
   ];
   const comp = openAICompletion(
     "chatcmpl-123",
-    "mimo-auto",
+    "hunyuan-turbo",
     1700000000,
     "",
     toolCalls,
@@ -98,19 +103,19 @@ test("openAICompletion sets finish_reason tool_calls when tools exist", () => {
 });
 
 test("openAIDelta constructs SSE chunk object", () => {
-  const deltaRole = openAIDelta("chatcmpl-123", "mimo-auto", 1700000000, null, "role");
+  const deltaRole = openAIDelta("chatcmpl-123", "hunyuan-turbo", 1700000000, null, "role");
   assert.equal(deltaRole.choices[0].delta.role, "assistant");
 
-  const deltaText = openAIDelta("chatcmpl-123", "mimo-auto", 1700000000, "Hello");
+  const deltaText = openAIDelta("chatcmpl-123", "hunyuan-turbo", 1700000000, "Hello");
   assert.equal(deltaText.choices[0].delta.content, "Hello");
 
-  const deltaFinish = openAIDelta("chatcmpl-123", "mimo-auto", 1700000000, null, "stop");
+  const deltaFinish = openAIDelta("chatcmpl-123", "hunyuan-turbo", 1700000000, null, "stop");
   assert.equal(deltaFinish.choices[0].finish_reason, "stop");
 });
 
 test("openAIStreamUsage constructs usage chunk object", () => {
   const usageObj = { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 };
-  const chunk = openAIStreamUsage("chatcmpl-123", "mimo-auto", 1700000000, usageObj);
+  const chunk = openAIStreamUsage("chatcmpl-123", "hunyuan-turbo", 1700000000, usageObj);
   assert.equal(chunk.object, "chat.completion.chunk");
   assert.deepEqual(chunk.usage, usageObj);
 });

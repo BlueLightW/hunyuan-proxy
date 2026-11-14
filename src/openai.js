@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { mimoModels } from "./config.js";
+import { hunyuanModels } from "./config.js";
 
 /**
  * Gera um ID de chat aleatório compatível com a API da OpenAI.
@@ -25,12 +25,12 @@ export function sse(res, obj) {
 export function openAIModels() {
   return {
     object: "list",
-    data: mimoModels.map((id) => ({
+    data: hunyuanModels.map((id) => ({
       id,
       object: "model",
       created: 0,
-      owned_by: "xiaomi",
-      _mimo_model: id,
+      owned_by: "tencent",
+      _hunyuan_model: id,
     })),
   };
 }
