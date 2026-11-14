@@ -1,639 +1,478 @@
-import { extractToolCalls, removeToolCallsFromText, detectFakeToolCalls } from './tool-handler.js';
-import { config } from './config.js';
+import {
+  extractToolCalls,
+  removeToolCallsFromText,
+  detectFakeToolCalls,
+  hasIncompleteToolCall,
+  buildToolsSystemPrompt,
+} from './tool-handler.js';
+import { genId, calculateUsage, openAICompletion } from './openai.js';
 
-const TENCENT_API_URL = process.env.TENCENT_API_URL || "https://api.hy.tencent.ai/api/new-portal/chat";
-const TENCENT_LOGIN_URL = process.env.TENCENT_LOGIN_URL || "https://aistudio.tencent.ai";
-const TENCENT_USER_AGENT = process.env.TENCENT_USER_AGENT || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
+const TENCENT_API_URL = process.env.TENCENT_API_URL || 'https://api.hy.tencent.ai/api/new-portal/chat';
+const TENCENT_LOGIN_URL = process.env.TENCENT_LOGIN_URL || 'https://aistudio.tencent.ai';
 
 function getConversationId(base) {
-    return `${base}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  return `${base}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function extractSystemPrompt(messages) {
-    for (const m of messages) {
-        if (m.role === 'system' && typeof m.content === 'string') {
-            return m.content;
-        }
-    }
-    return null;
+function contentToText(content) {
+  if (content == null) return '';
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content.map(part => {
+      if (!part) return '';
+      if (typeof part === 'string') return part;
+      if (part.type === 'text' && typeof part.text === 'string') return part.text;
+      if (part.type === 'input_text' && typeof part.text === 'string') return part.text;
+      if (part.type === 'tool_result' && typeof part.content === 'string') return part.content;
+      try { return JSON.stringify(part); } catch { return ''; }
+    }).join('\n');
+  }
+  if (typeof content === 'object') {
+    if (typeof content.text === 'string') return content.text;
+    try { return JSON.stringify(content); } catch { return String(content); }
+  }
+  return String(content);
 }
 
-function buildHunyuanPrompt(messages, tools, toolChoice) {
-    let formattedPrompt = "";
-    
-    if (tools && tools.length > 0) {
-        const toolsJson = JSON.stringify(tools, null, 2);
-        formattedPrompt += `\n\n<tools>\n${toolsJson}\n</tools>\nInstrucao: Se precisar usar uma ferramenta, retorne estritamente um bloco JSON no formato: {"name": "...", "arguments": {...}}\n`;
-    }
+function formatAssistantMessage(msg) {
+  let text = contentToText(msg.content).trim();
+  if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
+    const calls = msg.tool_calls.map(tc => {
+      const name = tc?.function?.name || tc?.name || 'unknown_tool';
+      let args = tc?.function?.arguments ?? tc?.arguments ?? {};
+      if (typeof args !== 'string') {
+        try { args = JSON.stringify(args); } catch { args = '{}'; }
+      }
+      return `<tool_call>\n<name>${name}</name>\n<arguments>${args}</arguments>\n</tool_call>`;
+    }).join('\n');
+    text = text ? `${text}\n${calls}` : calls;
+  }
+  return text;
+}
 
+function formatToolMessage(msg) {
+  const toolId = msg.tool_call_id || msg.toolCallId || msg.id || 'unknown';
+  const content = contentToText(msg.content);
+  return `[Resultado da Ferramenta para ${toolId}]: ${content}`;
+}
+
+export function buildHunyuanPrompt(messages, tools, toolChoice = 'auto') {
+  let prompt = '';
+  const systemParts = [];
+
+  if (Array.isArray(messages)) {
     for (const msg of messages) {
-        const role = msg.role;
-        const content = msg.content || "";
-        if (role === 'system') {
-            formattedPrompt += `[Sistema]: ${content}\n`;
-        } else if (role === 'user') {
-            formattedPrompt += `[Usuario]: ${content}\n`;
-        } else if (role === 'assistant') {
-            formattedPrompt += `[Assistente]: ${content}\n`;
-        } else if (role === 'tool') {
-            formattedPrompt += `[Resultado da Ferramenta]: ${content}\n`;
-        }
+      if (msg?.role === 'system') {
+        const t = contentToText(msg.content).trim();
+        if (t) systemParts.push(t);
+      }
     }
+  }
 
-    formattedPrompt += "\n[Assistente]: ";
-    return formattedPrompt;
+  const toolsBlock = buildToolsSystemPrompt(tools, toolChoice);
+  if (toolsBlock) systemParts.push(toolsBlock.trim());
+
+  if (systemParts.length > 0) {
+    prompt += `[Sistema]:\n${systemParts.join('\n\n')}\n\n`;
+  }
+
+  if (Array.isArray(messages)) {
+    for (const msg of messages) {
+      const role = msg?.role;
+      if (!role || role === 'system') continue;
+      if (role === 'user') {
+        prompt += `[Usu�rio]:\n${contentToText(msg.content)}\n\n`;
+      } else if (role === 'assistant') {
+        prompt += `[Assistente]:\n${formatAssistantMessage(msg)}\n\n`;
+      } else if (role === 'tool') {
+        prompt += `[Ferramenta]:\n${formatToolMessage(msg)}\n\n`;
+      } else {
+        prompt += `[${role}]:\n${contentToText(msg.content)}\n\n`;
+      }
+    }
+  }
+
+  prompt += '[Assistente]:';
+  return prompt;
 }
 
 function buildTencentPayload(prompt, requestData) {
-    // Payload format based on actual Tencent API
-    return {
-        model: "gpt_175B_0404",
-        prompt: prompt,
-        displayPrompt: prompt,
-        displayPromptType: 1,
-        plugin: "Adaptive",
-        options: {
-            imageIntention: {
-                needIntentionModel: true,
-                backendUpdateFlag: 2
-            }
-        },
-        targetLang: null,
-        targetLangLabel: null,
-        sourceLang: null,
-        sourceLangLabel: null,
-        translateModelList: [],
-        podcast: { voices: [] },
-        effort: "high",
-        displayImageIntentionLabels: [],
-        multimedia: [],
-        agentId: "HunyuanDefault",
-        customParams: {
-            max_output_tokens: 65536,
-            repetition_penalty: 1,
-            temperature: requestData.temperature ?? 0.7,
-            top_p: requestData.top_p ?? 1
-        },
-        supportHint: 1,
-        version: "v2",
-        chatModelId: "hy4-g"
-    };
+  return {
+    model: 'gpt_175B_0404',
+    prompt,
+    displayPrompt: prompt,
+    displayPromptType: 1,
+    plugin: 'Adaptive',
+    options: {
+      imageIntention: { needIntentionModel: true, backendUpdateFlag: 2 },
+    },
+    targetLang: null,
+    targetLangLabel: null,
+    sourceLang: null,
+    sourceLangLabel: null,
+    translateModelList: [],
+    podcast: { voices: [] },
+    effort: 'high',
+    displayImageIntentionLabels: [],
+    multimedia: [],
+    agentId: 'HunyuanDefault',
+    customParams: {
+      max_output_tokens: requestData.max_tokens ?? 65536,
+      repetition_penalty: requestData.repetition_penalty ?? 1,
+      temperature: requestData.temperature ?? 0.7,
+      top_p: requestData.top_p ?? 1,
+    },
+    supportHint: 1,
+    version: 'v2',
+    chatModelId: 'hy4-g',
+  };
 }
 
 function createOpenAIChunk(chatId, model, created, delta, finishReason = null) {
-    return {
-        id: chatId,
-        object: "chat.completion.chunk",
-        created,
-        model,
-        choices: [{
-            index: 0,
-            delta,
-            finish_reason: finishReason
-        }]
-    };
+  return {
+    id: chatId,
+    object: 'chat.completion.chunk',
+    created,
+    model,
+    choices: [{ index: 0, delta, finish_reason: finishReason }],
+  };
 }
 
-function extractToolCallsFromStreamText(text) {
-    const toolCalls = [];
-    const seen = new Set();
-    let index = 0;
-
-    // Pattern 1: JSON tool call in the format {"name": "...", "arguments": {...}}
-    const re1 = /{"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{[\s\S]*?\})}/g;
-    let m;
-    while ((m = re1.exec(text)) !== null) {
-        try {
-            const name = m[1].trim();
-            const argsStr = m[2].trim();
-            const key = name + ":" + argsStr;
-            if (!seen.has(key)) {
-                seen.add(key);
-                toolCalls.push({
-                    id: "call_" + Date.now() + "_" + index++,
-                    type: "function",
-                    function: { name, arguments: argsStr }
-                });
-            }
-        } catch {}
+function parseTencentSSE(raw, onEvent) {
+  if (!raw || typeof raw !== 'string') return;
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('event:')) continue;
+    if (!trimmed.startsWith('data:')) continue;
+    const dataStr = trimmed.slice(5).trim();
+    if (!dataStr) continue;
+    if (dataStr === '[DONE]') {
+      onEvent({ done: true });
+      continue;
     }
-
-    // Pattern 2: XML tool_call format
-    const re2 = /<tool_call>\s*<name>([^<]+)<\/name>\s*<arguments>([\s\S]*?)<\/arguments>\s*<\/tool_call>/g;
-    while ((m = re2.exec(text)) !== null) {
-        try {
-            const name = m[1].trim();
-            const argsStr = m[2].trim();
-            const key = name + ":" + argsStr;
-            if (!seen.has(key)) {
-                seen.add(key);
-                toolCalls.push({
-                    id: "call_" + Date.now() + "_" + index++,
-                    type: "function",
-                    function: { name, arguments: argsStr }
-                });
-            }
-        } catch {}
-    }
-
-    return toolCalls;
-}
-
-// Extract session ID from page (localStorage, meta, or URL)
-async function getSessionId(page) {
     try {
-        const sessionId = await page.evaluate(() => {
-            // Try localStorage
-            for (let i = 0; i < localStorage.length; i++) {
-                const key = localStorage.key(i);
-                if (key && (key.includes('chat') || key.includes('session') || key.includes('conversation'))) {
-                    try {
-                        const val = JSON.parse(localStorage.getItem(key) || '{}');
-                        if (val.id) return val.id;
-                        if (val.chatId) return val.chatId;
-                        if (val.sessionId) return val.sessionId;
-                    } catch {}
-                }
-            }
-            // Try meta tags
-            const meta = document.querySelector('meta[name="chat-id"], meta[name="session-id"], meta[property="chat:id"]');
-            if (meta) return meta.getAttribute('content');
-            // Try data attributes
-            const bodyChatId = document.body.getAttribute('data-chat-id') || document.body.getAttribute('data-session-id');
-            if (bodyChatId) return bodyChatId;
-            // Try URL
-            const urlMatch = window.location.pathname.match(/\/chat\/([a-zA-Z0-9_-]+)/);
-            if (urlMatch) return urlMatch[1];
-            return null;
-        });
-        return sessionId;
-    } catch (e) {
-        console.log('[Hunyuan] Error getting session ID:', e.message);
-        return null;
+      onEvent({ data: JSON.parse(dataStr) });
+    } catch {
+      // ignore malformed chunks
     }
+  }
+}
+
+function buildFinalCompletion(requestData, fullText) {
+  const model = requestData.model || 'hunyuan-turbo';
+  const id = genId();
+  const created = Math.floor(Date.now() / 1000);
+  const toolCalls = extractToolCalls(fullText);
+  const cleanText = removeToolCallsFromText(fullText);
+  const fakeDetection = detectFakeToolCalls(fullText, requestData.tools);
+
+  if (toolCalls.length > 0) {
+    const usage = calculateUsage(requestData.messages, '', toolCalls);
+    const completion = openAICompletion(id, model, created, null, toolCalls, usage);
+    completion.choices[0].finish_reason = 'tool_calls';
+    return completion;
+  }
+
+  let content = cleanText;
+  if (fakeDetection.fake && requestData.tools?.length > 0) {
+    content += `\n\n[Proxy] O modelo mencionou ferramentas (${fakeDetection.mentionedTools.join(', ')}) em texto, mas n�o emitiu chamadas estruturadas.`;
+  }
+  const usage = calculateUsage(requestData.messages, content, null);
+  return openAICompletion(id, model, created, content || '', null, usage);
+}
+
+async function getSessionId(page) {
+  try {
+    return await page.evaluate(() => {
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (key && (key.includes('chat') || key.includes('session') || key.includes('conversation'))) {
+          try {
+            const val = JSON.parse(localStorage.getItem(key) || '{}');
+            if (val.id) return val.id;
+            if (val.chatId) return val.chatId;
+            if (val.sessionId) return val.sessionId;
+          } catch {}
+        }
+      }
+      const meta = document.querySelector('meta[name="chat-id"], meta[name="session-id"], meta[property="chat:id"]');
+      if (meta) return meta.getAttribute('content');
+      const bodyChatId = document.body.getAttribute('data-chat-id') || document.body.getAttribute('data-session-id');
+      if (bodyChatId) return bodyChatId;
+      const urlMatch = window.location.pathname.match(/\/chat\/([a-zA-Z0-9_-]+)/);
+      if (urlMatch) return urlMatch[1];
+      return null;
+    });
+  } catch (e) {
+    console.log('[Hunyuan] Error getting session ID:', e.message);
+    return null;
+  }
 }
 
 export async function fetchHunyuan(response, requestData) {
-    console.log('[Hunyuan] >>> fetchHunyuan START');
-    console.log('[Hunyuan Request] Model:', requestData.model);
-    console.log('[Hunyuan Request] Stream:', requestData.stream);
-    console.log('[Hunyuan Request] Tools count:', requestData.tools?.length || 0);
-    if (requestData.tools?.length > 0) {
-        console.log('[Hunyuan Request] Tool names:', requestData.tools.map(t => t.function?.name).join(', '));
-    }
-    console.log('[Hunyuan Request] Messages count:', requestData.messages?.length || 0);
-    console.log('[Hunyuan] Using API URL:', TENCENT_API_URL);
+  const stream = requestData?.stream !== false;
+  const messages = Array.isArray(requestData?.messages) ? requestData.messages : [];
+  const tools = Array.isArray(requestData?.tools) ? requestData.tools : null;
+  const toolChoice = requestData?.tool_choice ?? 'auto';
 
-    const { accountManager } = await import('./account-manager.js');
-    
-    const account = accountManager.accounts[0];
-    if (!account) throw new Error('Nenhuma conta cadastrada');
-    
-    console.log('[Hunyuan] Getting session...');
-    let session = await accountManager.getOrCreateSession(account);
-    console.log('[Hunyuan] Got session:', session.sessionId);
-    
-    // Verifica se o browser/página ainda estão válidos
+  console.log('[Hunyuan] Request', { model: requestData?.model, stream, tools: tools?.length || 0, messages: messages.length });
+
+  const { accountManager } = await import('./account-manager.js');
+  const account = accountManager.accounts[0];
+  if (!account) throw new Error('Nenhuma conta cadastrada');
+
+  let session = await accountManager.getOrCreateSession(account);
+
+  const ensureSession = async () => {
     const browser = session.browser?.browser?.();
     const isBrowserValid = browser && browser.isConnected();
     const isPageValid = session.page && !session.page.isClosed();
-    
-    if (!isBrowserValid || !isPageValid) {
-        console.log('[Hunyuan] Browser/page inválido, recriando sessão...');
-        accountManager.releaseSession(session.sessionId);
-        session = await accountManager.getOrCreateSession(account);
-        console.log('[Hunyuan] Nova sessão:', session.sessionId);
-    }
-    
-    // Valida se a sessão ainda está logada
-    console.log('[Hunyuan] Checking if logged in...');
     let isLoggedIn = false;
-    try {
+    if (isBrowserValid && isPageValid) {
+      try {
         isLoggedIn = await session.page.evaluate(() => {
-            return document.querySelector('textarea[placeholder="Ask me anything"]') !== null ||
-                   document.querySelector('div[contenteditable="true"]') !== null ||
-                   document.querySelector('button[aria-label*="new" i]') !== null;
+          return document.querySelector('textarea[placeholder="Ask me anything"]') !== null ||
+            document.querySelector('div[contenteditable="true"]') !== null ||
+            document.querySelector('button[aria-label*="new" i]') !== null;
         });
-    } catch (e) {
-        console.log('[Hunyuan] Erro ao verificar login, assumindo não logado:', e.message);
+      } catch {
         isLoggedIn = false;
+      }
     }
-    
-    console.log('[Hunyuan] isLoggedIn:', isLoggedIn);
-    
-    if (!isLoggedIn) {
-        console.log('[Hunyuan] Sessão expirada, reiniciando login...');
-        accountManager.releaseSession(session.sessionId);
-        session = await accountManager.getOrCreateSession(account);
-        console.log('[Hunyuan] Nova sessão após re-login:', session.sessionId);
+    if (!isBrowserValid || !isPageValid || !isLoggedIn) {
+      try { accountManager.releaseSession(session.sessionId); } catch {}
+      session = await accountManager.getOrCreateSession(account);
     }
-    
-    // Listener para detectar se browser/page fecha
-    session.page.on('close', () => {
-        console.log('[Hunyuan] Página fechada, liberando sessão');
-        accountManager.releaseSession(session.sessionId);
-    });
-    if (browser) {
-        browser.on('disconnected', () => {
-            console.log('[Hunyuan] Browser desconectado, liberando sessão');
-            accountManager.releaseSession(session.sessionId);
-        });
-    }
-    
-    // Capturar logs do browser
-    session.page.on('console', msg => {
-        const type = msg.type();
-        const text = msg.text();
-        if (type === 'log' || type === 'error' || type === 'warning') {
-            console.log(`[Browser] ${text}`);
-        }
-    });
-    session.page.on('pageerror', err => {
-        console.error('[Browser Page Error]', err.message);
+  };
+
+  await ensureSession();
+
+  try {
+    session.page.on('close', () => { try { accountManager.releaseSession(session.sessionId); } catch {} });
+    const b = session.browser?.browser?.();
+    if (b) b.on('disconnected', () => { try { accountManager.releaseSession(session.sessionId); } catch {} });
+  } catch {}
+
+  const prompt = buildHunyuanPrompt(messages, tools, toolChoice);
+  const payload = buildTencentPayload(prompt, requestData || {});
+  const conversationId = getConversationId(`${requestData?.model || 'hunyuan'}_${Date.now().toString().slice(0, -4)}`);
+
+  let sessionId = null;
+  try {
+    await session.page.goto('https://aistudio.tencent.ai/chat/new', { waitUntil: 'domcontentloaded' });
+    await session.page.waitForTimeout(4000);
+    await session.page.goto('https://api.hy.tencent.ai', { waitUntil: 'domcontentloaded' });
+    await session.page.waitForTimeout(1500);
+    await session.page.goto('https://aistudio.tencent.ai/chat/new', { waitUntil: 'domcontentloaded' });
+    await session.page.waitForTimeout(2500);
+    sessionId = await getSessionId(session.page);
+  } catch (e) {
+    console.log('[Hunyuan] UI navigation/session warning:', e.message);
+  }
+  if (!sessionId) sessionId = await getSessionId(session.page);
+
+  const finalApiUrl = sessionId ? `${TENCENT_API_URL}/${sessionId}` : TENCENT_API_URL;
+
+  if (stream) {
+    response.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no',
     });
 
-    const tools = requestData.tools || null;
-    const toolChoice = requestData.tool_choice || 'auto';
-    
-    // Constrói query com suporte a tools
-    const prompt = buildHunyuanPrompt(requestData.messages, tools, toolChoice);
-    const conversationId = getConversationId(`${requestData.model}_${Date.now().toString().slice(0, -4)}`);
-    
-    // Extrai componentes da mensagem
-    const systemPrompt = extractSystemPrompt(requestData.messages);
-    const fullPrompt = systemPrompt ? `${systemPrompt}\n\nUser: ${prompt}` : prompt;
-    
-    const payload = buildTencentPayload(fullPrompt, requestData);
+    const queue = [];
+    let resolver = null;
+    const funcName = `__sendChunk_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    await session.page.exposeFunction(funcName, (chunk) => {
+      queue.push(chunk);
+      if (resolver) { resolver(); resolver = null; }
+      return Promise.resolve();
+    });
 
-    // Get or create chat session ID - always create new chat to get fresh session
-    let sessionId = null;
-    console.log('[Hunyuan] Creating new chat session via UI...');
     try {
-        // Navigate to new chat page to create fresh session
-        await session.page.goto('https://aistudio.tencent.ai/chat/new', { waitUntil: "domcontentloaded" });
-        await session.page.waitForTimeout(5000);
-        
-        // Also visit API domain to ensure cookies are set
-        await session.page.goto('https://api.hy.tencent.ai', { waitUntil: "domcontentloaded" });
-        await session.page.waitForTimeout(2000);
-        
-        // Go back to chat page
-        await session.page.goto('https://aistudio.tencent.ai/chat/new', { waitUntil: "domcontentloaded" });
+      const currentUrl = session.page.url();
+      if (!currentUrl.includes('aistudio.tencent.ai')) {
+        await session.page.goto(TENCENT_LOGIN_URL, { waitUntil: 'domcontentloaded' });
         await session.page.waitForTimeout(3000);
-        
-        sessionId = await getSessionId(session.page);
-        console.log('[Hunyuan] New session ID after UI navigation:', sessionId);
-    } catch (e) {
-        console.log('[Hunyuan] UI navigation failed:', e.message);
-    }
-    
-    // Fallback: if still no session ID, try localStorage
-    if (!sessionId) {
-        sessionId = await getSessionId(session.page);
-        console.log('[Hunyuan] Fallback session ID from localStorage:', sessionId);
-    }
-    
-    const finalApiUrl = sessionId ? `${TENCENT_API_URL}/${sessionId}` : TENCENT_API_URL;
-    console.log('[Hunyuan] Using API URL:', finalApiUrl);
+      }
+    } catch {}
 
-    // ----------------------------------------
-    // STREAMING
-    // ----------------------------------------
-    if (requestData.stream) {
-        response.writeHead(200, {
-            'Content-Type': 'text/event-stream',
-            'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive',
-            'X-Accel-Buffering': 'no',
+    const chatId = `chatcmpl-${conversationId}`;
+    const created = Math.floor(Date.now() / 1000);
+    const model = requestData?.model || 'hunyuan-turbo';
+    response.write(`data: ${JSON.stringify(createOpenAIChunk(chatId, model, created, { role: 'assistant' }))}\n\n`);
+
+    const evalPromise = session.page.evaluate(async ({ payload, funcName, apiUrl, sessionId }) => {
+      const sendChunk = globalThis[funcName];
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 300000);
+        const res = await fetch(apiUrl, {
+          signal: controller.signal,
+          method: 'POST',
+          headers: {
+            'Content-Type': 'text/plain;charset=UTF-8',
+            'Accept': 'text/event-stream',
+            'X-AgentId': 'HunyuanDefault/' + sessionId,
+            'X-Requested-With': 'XMLHttpRequest',
+            'X-Source': 'web',
+            'chat_version': 'v1',
+          },
+          body: JSON.stringify(payload),
+          credentials: 'include',
+          mode: 'cors',
         });
 
-        let queue = [];
-        let resolver = null;
-        
-        const funcName = `__sendChunk_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-        await session.page.exposeFunction(funcName, (chunk) => {
-            queue.push(chunk);
-            if (resolver) { resolver(); resolver = null; }
-            return Promise.resolve();
-        });
-        
-        // Garante que estamos na página do chat
-        let currentUrl = session.page.url();
-        console.log('[Hunyuan] Current URL:', currentUrl);
-        
-        // Se não estamos na página do chat, navegar para lá
-        if (!currentUrl.includes('aistudio.tencent.ai')) {
-            console.log('[Hunyuan] Navegando para aistudio.tencent.ai...');
-            await session.page.goto(TENCENT_LOGIN_URL, { waitUntil: "domcontentloaded" });
-            await session.page.waitForTimeout(3000);
-            currentUrl = session.page.url();
-            console.log('[Hunyuan] Nova URL:', currentUrl);
+        if (!res.ok) {
+          const errText = await res.text();
+          throw new Error(`HTTP ${res.status} ${errText.slice(0, 500)}`);
         }
-        
-        const chatId = `chatcmpl-${conversationId}`;
-        const created = Math.floor(Date.now() / 1000);
-        
-        // Enviar role inicial
-        response.write('data: ' + JSON.stringify(createOpenAIChunk(chatId, requestData.model, created, { role: 'assistant' })) + '\n\n');
-        
-        const evalPromise = session.page.evaluate(async ({ payload, funcName, apiUrl, sessionId }) => {
-            const sendChunk = globalThis[funcName];
-            console.log('[Browser] >>> evaluate START');
-            try {
-                console.log('[Browser] Iniciando fetch para API:', apiUrl);
-                console.log('[Browser] URL atual:', window.location.href);
-                console.log('[Browser] Cookies:', document.cookie);
-                console.log('[Browser] Origin:', window.location.origin);
-                
-                const controller = new AbortController();
-                const timeout = setTimeout(() => controller.abort(), 120000);
-                
-                const res = await fetch(apiUrl, {
-                    signal: controller.signal,
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'text/plain;charset=UTF-8',
-                        'Accept': 'text/event-stream',
-                        'X-AgentId': 'HunyuanDefault/' + sessionId,
-                        'X-Requested-With': 'XMLHttpRequest',
-                        'X-Source': 'web',
-                        'chat_version': 'v1'
-                    },
-                    body: JSON.stringify(payload),
-                    credentials: 'include',
-                    mode: 'cors'
-                });
-                
-                console.log('[Browser] Response status:', res.status);
-                console.log('[Browser] Response headers:', [...res.headers.entries()]);
-                
-                if (!res.ok) {
-                    const errText = await res.text();
-                    console.error('[Browser] Error response body:', errText);
-                    throw new Error('HTTP ' + res.status + ' ' + errText.slice(0, 500));
-                }
-                
-                const reader = res.body.getReader();
-                const decoder = new TextDecoder();
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
-                    const decoded = decoder.decode(value, { stream: true });
-                    sendChunk(decoded);
-                }
-                clearTimeout(timeout);
-                sendChunk(null);
-                console.log('[Browser] >>> evaluate END - success');
-            } catch (e) {
-                console.error('[Browser] Fetch error:', e.message);
-                console.log('[Browser] >>> evaluate END - error:', e.message);
-                sendChunk('ERROR:' + e.message);
-                sendChunk(null);
-            }
-        }, { payload, funcName, apiUrl: finalApiUrl, sessionId });
-        
-        console.log('[Node] page.evaluate called, waiting...');
-        await new Promise(r => setTimeout(r, 100));
-        console.log('[Node] after initial wait');
-        
-        let evalError = null;
-        evalPromise.catch(e => {
-            evalError = e;
-            console.error('[Node] Browser evaluate error:', e.message);
-            if (resolver) resolver();
-        });
-        
-        const streamTimeout = setTimeout(() => {
-            if (!response.headersSent) {
-                response.writeHead(504, { "Content-Type": "application/json" });
-                response.end(JSON.stringify({ error: "Stream timeout" }));
-            } else {
-                response.end();
-            }
-        }, 300000);
-        
-        let finished = false;
-        
-        try {
-            let contentBuffer = '';
-            
-            while (true) {
-                if (queue.length === 0) {
-                    await new Promise((r) => { resolver = r; });
-                }
-                if (evalError) throw evalError;
-                const raw = queue.shift();
-                if (raw === null) break;
-                if (typeof raw === 'string' && raw.startsWith('ERROR:')) {
-                    throw new Error(raw.slice(6));
-                }
-                
-                // Parse do stream SSE do Hunyuan
-                for (const line of raw.split('\n')) {
-                    const trimmed = line.trim();
-                    if (!trimmed) continue;
-                    
-                    if (trimmed.startsWith('event:')) {
-                        continue;
-                    }
-                    
-                    if (!trimmed.startsWith('data:')) continue;
-                    
-                    const dataStr = trimmed.slice(5).trim();
-                    if (dataStr === '[DONE]') {
-                        finished = true;
-                        continue;
-                    }
-                    
-                    try {
-                        const data = JSON.parse(dataStr);
-                        
-                        if (data.type === 'text' && data.msg && typeof data.msg === 'string') {
-                            // Add to buffer first
-                            contentBuffer += data.msg;
-                            
-                            // Check if buffer contains a complete tool call
-                            const toolCalls = extractToolCallsFromStreamText(contentBuffer);
-                            if (toolCalls.length > 0) {
-                                // Send tool calls instead of content
-                                for (const tc of toolCalls) {
-                                    response.write('data: ' + JSON.stringify(createOpenAIChunk(chatId, requestData.model, created, {
-                                        tool_calls: [{
-                                            index: 0,
-                                            id: tc.id,
-                                            type: 'function',
-                                            function: tc.function
-                                        }]
-                                    })) + '\n\n');
-                                }
-                                contentBuffer = '';
-                            } else {
-                                // Heuristic: if buffer looks like it might be a tool call, hold back
-                                const buf = contentBuffer.trim();
-                                const looksLikeToolCall = buf.startsWith('{') && 
-                                    (buf.includes('"name"') || buf.includes('name":') || buf.includes('name:') || buf.includes('name'));
-                                if (!looksLikeToolCall) {
-                                    // Safe to send as content
-                                    response.write('data: ' + JSON.stringify(createOpenAIChunk(chatId, requestData.model, created, { content: data.msg })) + '\n\n');
-                                    contentBuffer = '';
-                                }
-                                // If it looks like a tool call, keep buffering
-                            }
-                        }
-                    } catch (e) {
-                        // Ignorar erros de parse
-                    }
-                }
-            }
-            
-            // Send any remaining content
-            if (contentBuffer) {
-                const toolCalls = extractToolCallsFromStreamText(contentBuffer);
-                if (toolCalls.length === 0) {
-                    response.write('data: ' + JSON.stringify(createOpenAIChunk(chatId, requestData.model, created, { content: contentBuffer })) + '\n\n');
-                }
-            }
-            
-            if (!finished) {
-                response.write('data: ' + JSON.stringify(createOpenAIChunk(chatId, requestData.model, created, null, 'stop')) + '\n\n');
-                response.write('data: [DONE]\n\n');
-            }
-            
-            await evalPromise;
-            clearTimeout(streamTimeout);
-            response.end();
-        } catch (e) {
-            console.error('[Hunyuan] Stream error:', e.message);
-            clearTimeout(streamTimeout);
-            if (!response.headersSent) {
-                response.writeHead(500, { 'Content-Type': 'application/json' });
-                response.end(JSON.stringify({ error: e.message }));
-            } else {
-                response.end();
-            }
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          sendChunk(decoder.decode(value, { stream: true }));
         }
-        
-        return null;
-    }
-    
-    // ----------------------------------------
-    // NON-STREAMING
-    // ----------------------------------------
+        clearTimeout(timeout);
+        sendChunk(null);
+      } catch (e) {
+        sendChunk('ERROR:' + (e?.message || String(e)));
+        sendChunk(null);
+      }
+    }, { payload, funcName, apiUrl: finalApiUrl, sessionId });
+
+    let evalError = null;
+    evalPromise.catch(e => { evalError = e; if (resolver) resolver(); });
+
+    const streamTimeout = setTimeout(() => { try { response.end(); } catch {} }, 300000);
+
     try {
-        const result = await session.page.evaluate(async ({ payload, apiUrl, sessionId }) => {
-            try {
-                console.log('[Browser Non-stream] Iniciando fetch para API:', apiUrl);
-                console.log('[Browser Non-stream] URL atual:', window.location.href);
-                
-                const res = await fetch(apiUrl, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'text/plain;charset=UTF-8',
-                        'X-AgentId': 'HunyuanDefault/' + sessionId,
-                        'X-Requested-With': 'XMLHttpRequest',
-                        'X-Source': 'web',
-                        'chat_version': 'v1'
-                    },
-                    credentials: 'include',
-                    mode: 'cors',
-                    body: JSON.stringify(payload),
-                });
-                
-                if (!res.ok) {
-                    const errText = await res.text();
-                    console.error('[Browser Non-stream] Error response body:', errText);
-                    throw new Error('HTTP ' + res.status + ' ' + errText.slice(0, 500));
-                }
-                
-                const text = await res.text();
-                let fullContent = '';
-                
-                // Parse SSE response
-                for (const line of text.split('\n')) {
-                    const trimmed = line.trim();
-                    if (!trimmed) continue;
-                    if (trimmed.startsWith('event:')) continue;
-                    if (!trimmed.startsWith('data:')) continue;
-                    
-                    const dataStr = trimmed.slice(5).trim();
-                    if (dataStr === '[DONE]') continue;
-                    
-                    try {
-                        const data = JSON.parse(dataStr);
-                        if (data.type === 'text' && data.msg && typeof data.msg === 'string') {
-                            fullContent += data.msg;
-                        }
-                    } catch {}
-                }
-                
-                return { status: res.status, text: fullContent };
-            } catch (e) {
-                return { status: 0, text: e.message };
+      let fullText = '';
+      let sentContentLen = 0;
+
+      while (true) {
+        if (queue.length === 0) {
+          await new Promise((r) => { resolver = r; });
+        }
+        if (evalError) throw evalError;
+        const raw = queue.shift();
+        if (raw === null) break;
+        if (typeof raw === 'string' && raw.startsWith('ERROR:')) throw new Error(raw.slice(6));
+
+        parseTencentSSE(raw, ({ data }) => {
+          if (data?.type === 'text' && typeof data.msg === 'string') {
+            fullText += data.msg;
+
+            if (hasIncompleteToolCall(fullText)) return;
+            const toolCalls = extractToolCalls(fullText);
+            if (toolCalls.length > 0) return;
+
+            const clean = removeToolCallsFromText(fullText);
+            if (clean.length > sentContentLen) {
+              const delta = clean.slice(sentContentLen);
+              if (delta) {
+                response.write(`data: ${JSON.stringify(createOpenAIChunk(chatId, model, created, { content: delta }))}\n\n`);
+                sentContentLen = clean.length;
+              }
             }
-        }, { payload, apiUrl: finalApiUrl, sessionId });
-        
-        // Validação de erro
-        if (result.status < 200 || result.status >= 300) {
-            throw new Error('Hunyuan retornou erro: ' + result.text);
+          }
+        });
+      }
+
+      const toolCalls = extractToolCalls(fullText);
+      if (toolCalls.length > 0) {
+        for (let i = 0; i < toolCalls.length; i++) {
+          const tc = toolCalls[i];
+          response.write(`data: ${JSON.stringify(createOpenAIChunk(chatId, model, created, {
+            tool_calls: [{
+              index: i,
+              id: tc.id,
+              type: 'function',
+              function: tc.function,
+            }],
+          }))}\n\n`);
         }
-        
-        // Extrai tool calls do texto completo
-        const toolCalls = extractToolCallsFromStreamText(result.text);
-        const cleanText = removeToolCallsFromText(result.text);
-        
-        console.log('[Hunyuan Debug] Raw text length:', result.text.length);
-        console.log('[Hunyuan Debug] Tool calls found:', toolCalls.length);
-        console.log('[Hunyuan Debug] Raw snippet:', result.text.substring(0, 500));
-        
-        // Detecta "fake tool calls"
-        const fakeDetection = detectFakeToolCalls(result.text, requestData.tools);
-        if (fakeDetection.fake) {
-            console.warn('[Hunyuan] WARNING:', fakeDetection.hint);
+        response.write(`data: ${JSON.stringify(createOpenAIChunk(chatId, model, created, {}, 'tool_calls'))}\n\n`);
+      } else {
+        const clean = removeToolCallsFromText(fullText);
+        if (clean.length > sentContentLen) {
+          const delta = clean.slice(sentContentLen);
+          if (delta) response.write(`data: ${JSON.stringify(createOpenAIChunk(chatId, model, created, { content: delta }))}\n\n`);
         }
-        
-        const chatId = `chatcmpl-${conversationId}`;
-        const created = Math.floor(Date.now() / 1000);
-        
-        // Se há tool calls, retorna no formato OpenAI
-        if (toolCalls.length > 0) {
-            return {
-                choices: [{
-                    message: {
-                        role: 'assistant',
-                        content: null,
-                        tool_calls: toolCalls
-                    },
-                    finish_reason: 'tool_calls'
-                }]
-            };
-        }
-        
-        // Se o modelo mencionou tools mas não chamou
-        if (fakeDetection.fake && requestData.tools && requestData.tools.length > 0) {
-            const hint = `\n\n[Proxy] O modelo Hunyuan mencionou as tools (${fakeDetection.mentionedTools.join(', ')}) em texto natural, mas nao emitiu chamadas estruturadas.`;
-            return {
-                choices: [{
-                    message: {
-                        role: 'assistant',
-                        content: cleanText + hint
-                    },
-                    finish_reason: 'stop'
-                }]
-            };
-        }
-        
-        // Senão, retorna como texto normal
-        return { 
-            choices: [{ 
-                message: { 
-                    role: 'assistant', 
-                    content: cleanText 
-                },
-                finish_reason: 'stop'
-            }] 
-        };
+        response.write(`data: ${JSON.stringify(createOpenAIChunk(chatId, model, created, {}, 'stop'))}\n\n`);
+      }
+
+      response.write('data: [DONE]\n\n');
+      await evalPromise.catch(() => {});
+      clearTimeout(streamTimeout);
+      try { response.end(); } catch {}
     } catch (e) {
-        console.error('[Hunyuan] Non-stream error:', e.message);
-        throw e;
+      console.error('[Hunyuan] Stream error:', e.message);
+      clearTimeout(streamTimeout);
+      if (!response.headersSent) {
+        response.writeHead(500, { 'Content-Type': 'application/json' });
+        response.end(JSON.stringify({ error: { message: e.message, type: 'server_error' } }));
+      } else {
+        try { response.end(); } catch {}
+      }
     }
+
+    return null;
+  }
+
+  // Non-streaming (stream=false)
+  try {
+    const result = await session.page.evaluate(async ({ payload, apiUrl, sessionId }) => {
+      try {
+        const res = await fetch(apiUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'text/plain;charset=UTF-8',
+            'Accept': 'text/event-stream',
+            'X-AgentId': 'HunyuanDefault/' + sessionId,
+            'X-Requested-With': 'XMLHttpRequest',
+            'X-Source': 'web',
+            'chat_version': 'v1',
+          },
+          credentials: 'include',
+          mode: 'cors',
+          body: JSON.stringify(payload),
+        });
+
+        if (!res.ok) {
+          const errText = await res.text();
+          throw new Error(`HTTP ${res.status} ${errText.slice(0, 500)}`);
+        }
+
+        const text = await res.text();
+        let fullContent = '';
+        for (const line of text.split('\n')) {
+          const trimmed = line.trim();
+          if (!trimmed || trimmed.startsWith('event:')) continue;
+          if (!trimmed.startsWith('data:')) continue;
+          const dataStr = trimmed.slice(5).trim();
+          if (dataStr === '[DONE]') continue;
+          try {
+            const data = JSON.parse(dataStr);
+            if (data.type === 'text' && typeof data.msg === 'string') fullContent += data.msg;
+          } catch {}
+        }
+        return { status: res.status, text: fullContent };
+      } catch (e) {
+        return { status: 0, text: e?.message || String(e) };
+      }
+    }, { payload, apiUrl: finalApiUrl, sessionId });
+
+    if (result.status < 200 || result.status >= 300) {
+      throw new Error('Hunyuan retornou erro: ' + (result.text || 'unknown'));
+    }
+
+    return buildFinalCompletion(requestData || {}, result.text || '');
+  } catch (e) {
+    console.error('[Hunyuan] Non-stream error:', e.message);
+    throw e;
+  }
 }
