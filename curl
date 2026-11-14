@@ -1,0 +1,21 @@
+curl --url ^"https://api.hy.tencent.ai/api/new-portal/chat/dbsebo42c3m3be4ucd60^" ^
+  -H ^"accept: */*^" ^
+  -H ^"accept-language: en^" ^
+  -H ^"chat_version: v1^" ^
+  -H ^"content-type: text/plain;charset=UTF-8^" ^
+  -b ^"hunyuan_user=44b9059747ac4f16ac58aab1378da9d3; hunyuan_token=8c5Y7fqOWqeWlhS9AqOiJFIl6gnHBeY1VCEgeZmKooJlfxxSmvZ5RZaxhTuRxZbw1M2XFJuBR9e3GNs4De+kdA==; hunyuan_source=web^" ^
+  -H ^"credentials: include^" ^
+  -H ^"mode: cors^" ^
+  -H ^"origin: https://aistudio.tencent.ai^" ^
+  -H ^"priority: u=1, i^" ^
+  -H ^"referer: https://aistudio.tencent.ai/^" ^
+  -H ^"sec-ch-ua: ^\^"Not.A/Brand^\^";v=^\^"24^\^", ^\^"Chromium^\^";v=^\^"158^\^"^" ^
+  -H ^"sec-ch-ua-mobile: ?0^" ^
+  -H ^"sec-ch-ua-platform: ^\^"Windows^\^"^" ^
+  -H ^"sec-fetch-dest: empty^" ^
+  -H ^"sec-fetch-mode: cors^" ^
+  -H ^"sec-fetch-site: same-site^" ^
+  -H ^"user-agent: Mozilla/5.0 ^(Windows NT 10.0; Win64; x64^) AppleWebKit/537.36 ^(KHTML, like Gecko^) Chrome/158.0.0.0 Safari/537.36^" ^
+  -H ^"x-agentid: HunyuanDefault^" ^
+  -H ^"x-requested-with: XMLHttpRequest^" ^
+  --data-raw ^"^{^\^"model^\^":^\^"gpt_175B_0404^\^",^\^"prompt^\^":^\^"ol^ ^\^",^\^"plugin^\^":^\^"Adaptive^\^",^\^"displayPrompt^\^":^\^"ol^ ^\^",^\^"displayPromptType^\^":1,^\^"quickThink^\^":false,^\^"targetLang^\^":^\^"^\^",^\^"targetLangLabel^\^":^\^"^\^",^\^"sourceLang^\^":^\^"^\^",^\^"sourceLangLabel^\^":^\^"^\^",^\^"podcast^\^":^{^\^"voices^\^":^[^]^},^\^"effort^\^":^\^"high^\^",^\^"multimedia^\^":^[^],^\^"agentId^\^":^\^"HunyuanDefault^\^",^\^"customParams^\^":^{^\^"temperature^\^":0.9,^\^"top_p^\^":1,^\^"repetition_penalty^\^":1,^\^"max_output_tokens^\^":65536^},^\^"supportHint^\^":1,^\^"version^\^":^\^"v2^\^",^\^"chatModelId^\^":^\^"hy4-g^\^"^}^"
